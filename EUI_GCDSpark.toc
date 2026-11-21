@@ -1,0 +1,10 @@
+## Interface: 120000, 120001, 120005, 120007, 120100, 120105, 16001
+## Title: |cff0cd29fEUI|r Sparks
+## Notes: Overlay sparks for the EllesmereUI player power bar (global cooldown) and cast bar. Works without editing EllesmereUI.
+## Author: jadee
+## Version: 1.1.0
+## Dependencies: EllesmereUI
+## OptionalDeps: EllesmereUIUnitFrames
+## SavedVariables: EUI_GCDSparkDB
+
+EUI_GCDSpark.lua
