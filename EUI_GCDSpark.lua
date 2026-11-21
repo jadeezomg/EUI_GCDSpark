@@ -2,12 +2,12 @@ if EUI_CLIENT_BLOCKED then return end -- same pre-12.1 client failsafe the Elles
 -------------------------------------------------------------------------------
 --  EUI_GCDSpark.lua
 --
---  Standalone overlay sparks for the EllesmereUI player frames:
+--  Standalone player/target overlays for EllesmereUI:
 --    - a global cooldown spark on the power bar,
---    - a cast spark on the cast bar (follows casts, channels and empowers).
+--    - a cast spark on the cast bar (follows casts, channels and empowers),
+--    - the missing health amount as text on the player and target health bars.
 --  It never edits or hooks an EllesmereUI file: it asks EUI for the player
---  unit frame, takes its .Power StatusBar and .Castbar StatusBar, and draws
---  its own textures on them.
+--  unit frame and its bars, and draws its own children on them.
 --
 --  The power spark is a StatusBar parented to the power bar, with the
 --  engine's own GCD duration object fed to SetTimerDuration, so it moves with
@@ -19,8 +19,13 @@ if EUI_CLIENT_BLOCKED then return end -- same pre-12.1 client failsafe the Elles
 --  fill animation carries it; EUI's cast driver already shows and hides
 --  element.Spark at cast start/stop/fail.
 --
---  Settings live in EUI_GCDSparkDB and are also exposed as a plugin section
---  in the EllesmereUI options panel.
+--  Missing health uses UnitHealthMissing, which is secret-safe, and passes the
+--  amount through AbbreviateValue into SetFormattedText: no Lua arithmetic or
+--  string concatenation on unit data.
+--
+--  Settings live in EUI_GCDSparkDB and are exposed as plugin modules. The
+--  modules join LootRollFrames' single "Plugins" sidebar section through the
+--  EUI_PLUGIN_SECTIONS table, so they do not add a second Plugins header.
 -------------------------------------------------------------------------------
 
 local ADDON_NAME, ns = ...
@@ -28,7 +33,11 @@ local ADDON_NAME, ns = ...
 local EllesmereUI = _G.EllesmereUI
 if not EllesmereUI then return end
 
-local DEFAULTS = { enabled = true, width = 8, castbarEnabled = true, castbarWidth = 8 }
+local DEFAULTS = {
+    enabled = true, width = 8, castbarEnabled = true, castbarWidth = 8,
+    missingPlayer = true, missingTarget = true, missingPos = "center",
+    missingColor = { r = 1, g = 0.35, b = 0.35, a = 1 },
+}
 local MAX_GCD = 1.6
 local GCD_SPELL = EllesmereUI.GCD_SPELL or 61304
 local SPARK_TEX = "Interface\\AddOns\\EllesmereUI\\media\\cast_spark.tga"
@@ -36,6 +45,13 @@ local IMMEDIATE = Enum.StatusBarInterpolation.Immediate
 local ELAPSED = Enum.StatusBarTimerDirection.ElapsedTime
 local GetCD = C_Spell and C_Spell.GetSpellCooldown
 local GetCDDur = C_Spell and C_Spell.GetSpellCooldownDuration
+local UnitHealthMissing = _G.UnitHealthMissing
+local UnitHealth, UnitHealthMax = _G.UnitHealth, _G.UnitHealthMax
+local UnitExists = _G.UnitExists
+local UnitIsConnected = _G.UnitIsConnected
+local UnitIsDeadOrGhost = _G.UnitIsDeadOrGhost
+local UnitHasVehicleUI = _G.UnitHasVehicleUI
+local AbbreviateNumbers = _G.AbbreviateNumbers
 
 local DB = _G.EUI_GCDSparkDB
 if type(DB) ~= "table" then
@@ -46,11 +62,19 @@ if DB.enabled == nil then DB.enabled = DEFAULTS.enabled end
 if DB.width == nil then DB.width = DEFAULTS.width end
 if DB.castbarEnabled == nil then DB.castbarEnabled = DEFAULTS.castbarEnabled end
 if DB.castbarWidth == nil then DB.castbarWidth = DEFAULTS.castbarWidth end
+if DB.missingPlayer == nil then DB.missingPlayer = DEFAULTS.missingPlayer end
+if DB.missingTarget == nil then DB.missingTarget = DEFAULTS.missingTarget end
+if DB.missingPos == nil then DB.missingPos = DEFAULTS.missingPos end
+if DB.missingColor == nil then
+    local c = DEFAULTS.missingColor
+    DB.missingColor = { r = c.r, g = c.g, b = c.b, a = c.a }
+end
 
 local frame = CreateFrame("Frame")
 local overlay
 local hookedBar
 local EnsureOverlay
+local OwnSection
 local castSpark            -- the castbar spark texture (castbar.Spark)
 local castBar              -- the castbar holding it
 local gcdEnd              -- end time of the running GCD sweep; nil while idle
@@ -97,6 +121,178 @@ local function GetCastbar()
         return cb
     end
     return nil
+end
+
+-------------------------------------------------------------------------------
+--  Missing health text
+--
+--  A FontString over the player/target health bar showing the missing amount
+--  (-12.3K). UnitHealthMissing handles secret values; the amount goes through
+--  AbbreviateValue (also secret-safe) and into SetFormattedText, never Lua
+--  arithmetic or concatenation.
+-------------------------------------------------------------------------------
+local missingRecs = {}   -- unit -> { bar, box, fs }
+
+local function GetUnitFrame(unit)
+    if unit == "player" then
+        return GetPlayerFrame()
+    elseif unit == "target" then
+        return _G.EllesmereUIUnitFrames_Target
+    end
+    return nil
+end
+
+local function MissingValue(unit)
+    if UnitHealthMissing then return UnitHealthMissing(unit, true) end
+    if not (UnitHealth and UnitHealthMax) then return nil end
+    local cur, max = UnitHealth(unit), UnitHealthMax(unit)
+    if issecretvalue and (issecretvalue(cur) or issecretvalue(max)) then return nil end
+    if type(cur) == "number" and type(max) == "number" then return max - cur end
+    return nil
+end
+
+local function IsZeroValue(v)
+    if EllesmereUI.IsZeroValue then return EllesmereUI.IsZeroValue(v) end
+    if issecretvalue and issecretvalue(v) then return false end
+    return v == 0
+end
+
+local function FormatMissing(v)
+    if EllesmereUI.AbbreviateValue then return EllesmereUI.AbbreviateValue(v, "health") end
+    if AbbreviateNumbers then return AbbreviateNumbers(v) end
+    return nil
+end
+
+local function MissingOn(unit)
+    if unit == "player" then return DB.missingPlayer == true end
+    if unit == "target" then return DB.missingTarget == true end
+    return false
+end
+
+-- A vehicle swaps the player frame to the vehicle unit; read that health.
+local function PlayerHealthUnit()
+    if UnitHasVehicleUI and UnitExists and UnitExists("vehicle") and UnitHasVehicleUI("player") then
+        return "vehicle"
+    end
+    return "player"
+end
+
+-- Matches the unit frame's own text (font path, size and outline flag).
+local function MissingFont(frame)
+    local src = frame.CenterText or frame.RightText or frame.LeftText
+    if src then
+        local path, size, flags = src:GetFont()
+        if path then return path, size, flags end
+    end
+    local path = EllesmereUI.GetFontPath and EllesmereUI.GetFontPath("unitFrames")
+    local flags = EllesmereUI.GetFontOutlineFlag and EllesmereUI.GetFontOutlineFlag("unitFrames")
+    return path or "Fonts\\FRIZQT__.TTF", 12, flags or ""
+end
+
+local function LayoutMissing(rec)
+    local fs, bar = rec.fs, rec.bar
+    fs:ClearAllPoints()
+    local pos = DB.missingPos or "center"
+    if pos == "left" then
+        fs:SetJustifyH("LEFT")
+        fs:SetPoint("LEFT", bar, "LEFT", 5, 0)
+    elseif pos == "right" then
+        fs:SetJustifyH("RIGHT")
+        fs:SetPoint("RIGHT", bar, "RIGHT", -5, 0)
+    else
+        fs:SetJustifyH("CENTER")
+        fs:SetPoint("CENTER", bar, "CENTER", 0, 0)
+    end
+    local c = DB.missingColor
+    fs:SetTextColor(c.r, c.g, c.b, c.a or 1)
+end
+
+local function EnsureMissing(unit)
+    local frame = GetUnitFrame(unit)
+    local bar = frame and frame.Health
+    if not bar or not bar.CreateFontString then
+        local rec = missingRecs[unit]
+        if rec then rec.box:Hide() end
+        return nil
+    end
+    local rec = missingRecs[unit]
+    if rec and rec.bar == bar and rec.box:GetParent() == bar then
+        LayoutMissing(rec)
+        return rec
+    end
+    if InCombatLockdown() then return nil end
+    if rec then rec.box:Hide() end
+    local box = CreateFrame("Frame", nil, bar)
+    box:SetAllPoints(bar)
+    box:SetFrameLevel(bar:GetFrameLevel() + 14)
+    local fs = box:CreateFontString(nil, "OVERLAY")
+    local path, size, flags = MissingFont(frame)
+    fs:SetFont(path, size, flags)
+    fs:SetWordWrap(false)
+    box.fs = fs
+    rec = { bar = bar, box = box, fs = fs }
+    missingRecs[unit] = rec
+    LayoutMissing(rec)
+    return rec
+end
+
+local function UpdateMissing(unit)
+    local rec = missingRecs[unit]
+    if not MissingOn(unit) then
+        if rec then rec.box:Hide() end
+        return
+    end
+    local realUnit = (unit == "player") and PlayerHealthUnit() or unit
+    if not UnitExists or not UnitExists(realUnit) then
+        if rec then rec.box:Hide() end
+        return
+    end
+    if (UnitIsConnected and not UnitIsConnected(realUnit))
+       or (UnitIsDeadOrGhost and UnitIsDeadOrGhost(realUnit)) then
+        if rec then rec.box:Hide() end
+        return
+    end
+    local v = MissingValue(realUnit)
+    if v == nil or IsZeroValue(v) then
+        if rec then rec.box:Hide() end
+        return
+    end
+    rec = EnsureMissing(unit)
+    if not rec then return end
+    local text = FormatMissing(v)
+    if text == nil then
+        rec.box:Hide()
+        return
+    end
+    rec.fs:SetFormattedText("-%s", text)
+    rec.box:Show()
+end
+
+local function SetMissingListening(on)
+    if on then
+        frame:RegisterUnitEvent("UNIT_HEALTH", "player", "target")
+        frame:RegisterUnitEvent("UNIT_MAXHEALTH", "player", "target")
+        frame:RegisterUnitEvent("UNIT_MAX_HEALTH_MODIFIERS_CHANGED", "player", "target")
+        frame:RegisterUnitEvent("UNIT_CONNECTION", "player", "target")
+        frame:RegisterEvent("PLAYER_TARGET_CHANGED")
+    else
+        frame:UnregisterEvent("UNIT_HEALTH")
+        frame:UnregisterEvent("UNIT_MAXHEALTH")
+        frame:UnregisterEvent("UNIT_MAX_HEALTH_MODIFIERS_CHANGED")
+        frame:UnregisterEvent("UNIT_CONNECTION")
+        frame:UnregisterEvent("PLAYER_TARGET_CHANGED")
+    end
+end
+
+local function ApplyMissing()
+    local on = DB.missingPlayer == true or DB.missingTarget == true
+    SetMissingListening(on)
+    if not on then
+        for _, rec in pairs(missingRecs) do rec.box:Hide() end
+        return
+    end
+    UpdateMissing("player")
+    UpdateMissing("target")
 end
 
 local function HideSpark()
@@ -381,10 +577,22 @@ local function Apply()
     if DB.castbarEnabled then EnsureCastSpark() else HideCastSpark() end
 end
 
-frame:SetScript("OnEvent", function(_, event)
+frame:SetScript("OnEvent", function(_, event, unit)
     if event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD" then
         Apply()
+        ApplyMissing()
+        OwnSection()
         C_Timer.After(1, Apply)
+        C_Timer.After(1, ApplyMissing)
+        return
+    end
+    if event == "PLAYER_TARGET_CHANGED" then
+        UpdateMissing("target")
+        return
+    end
+    if event == "UNIT_HEALTH" or event == "UNIT_MAXHEALTH"
+       or event == "UNIT_MAX_HEALTH_MODIFIERS_CHANGED" or event == "UNIT_CONNECTION" then
+        if unit == "player" or unit == "target" then UpdateMissing(unit) end
         return
     end
     if event == "SPELL_UPDATE_COOLDOWN" then
@@ -453,36 +661,120 @@ local function BuildPage(pageName, parent, yOffset)
     return math.abs(y)
 end
 
-if EllesmereUI.RegisterPlugin then
-    EllesmereUI.RegisterPlugin("EUI_GCDSpark", {
-        -- EUI gives every plugin its own sidebar section; there is no shared
-        -- "Plugins" group, so the section itself is named Plugins, the same
-        -- convention LootRollFrames uses.
-        label = "Plugins",
-        modules = {
-            {
-                key = "Spark",
-                title = "Sparks",
-                description = "Overlay sparks for the player power bar and cast bar, independent of EllesmereUI updates.",
-                pages = { "Settings" },
-                buildPage = BuildPage,
-                onReset = function()
-                    DB.enabled = DEFAULTS.enabled
-                    DB.width = DEFAULTS.width
-                    DB.castbarEnabled = DEFAULTS.castbarEnabled
-                    DB.castbarWidth = DEFAULTS.castbarWidth
-                    Apply()
-                end,
-            },
-        },
-    })
+local function BuildMissingPage(pageName, parent, yOffset)
+    local W = EllesmereUI.Widgets
+    if not W then return 0 end
+    local y = yOffset
+    local _, h
+    _, h = W:SectionHeader(parent, "MISSING HEALTH", y); y = y - h
+    _, h = W:DualRow(parent, y,
+        { type="toggle", text="Player Frame",
+          tooltip="Show the missing health amount on the player health bar.",
+          getValue=function() return DB.missingPlayer == true end,
+          setValue=function(v)
+              DB.missingPlayer = v and true or false
+              ApplyMissing()
+          end },
+        { type="toggle", text="Target Frame",
+          tooltip="Show the missing health amount on the target health bar.",
+          getValue=function() return DB.missingTarget == true end,
+          setValue=function(v)
+              DB.missingTarget = v and true or false
+              ApplyMissing()
+          end }); y = y - h
+    _, h = W:DualRow(parent, y,
+        { type="dropdown", text="Text Position",
+          values = { left="Left", center="Center", right="Right" },
+          order = { "left", "center", "right" },
+          tooltip="Where the missing health text sits on the health bar.",
+          getValue=function() return DB.missingPos or "center" end,
+          setValue=function(v)
+              DB.missingPos = v
+              ApplyMissing()
+          end },
+        { type="colorpicker", text="Text Color", hasAlpha=true,
+          tooltip="Color of the missing health text.",
+          getValue=function()
+              local c = DB.missingColor
+              return c.r, c.g, c.b, c.a
+          end,
+          setValue=function(r, g, b, a)
+              DB.missingColor = { r = r, g = g, b = b, a = a or 1 }
+              ApplyMissing()
+          end }); y = y - h
+    return math.abs(y)
+end
+
+local MODULES = {
+    {
+        key = "EUI_Sparks",
+        title = "Sparks",
+        description = "Overlay sparks for the player power bar and cast bar, independent of EllesmereUI updates.",
+        pages = { "Settings" },
+        buildPage = BuildPage,
+        onReset = function()
+            DB.enabled = DEFAULTS.enabled
+            DB.width = DEFAULTS.width
+            DB.castbarEnabled = DEFAULTS.castbarEnabled
+            DB.castbarWidth = DEFAULTS.castbarWidth
+            Apply()
+        end,
+    },
+    {
+        key = "EUI_MissingHealth",
+        title = "Missing Health",
+        description = "Shows the missing health amount on the player and target health bars.",
+        pages = { "Settings" },
+        buildPage = BuildMissingPage,
+        onReset = function()
+            DB.missingPlayer = DEFAULTS.missingPlayer
+            DB.missingTarget = DEFAULTS.missingTarget
+            DB.missingPos = DEFAULTS.missingPos
+            local c = DEFAULTS.missingColor
+            DB.missingColor = { r = c.r, g = c.g, b = c.b, a = c.a }
+            ApplyMissing()
+        end,
+    },
+}
+
+-- EUI gives each plugin its own sidebar section. LootRollFrames registers the
+-- shared "Plugins" section; publish our modules there so both addons appear as
+-- one section with three rows. Without LootRollFrames, register our own.
+local REG = _G.EUI_PLUGIN_SECTIONS
+if type(REG) ~= "table" then
+    REG = {}
+    _G.EUI_PLUGIN_SECTIONS = REG
+end
+local SECTION = REG.Plugins
+if type(SECTION) ~= "table" then
+    SECTION = { label = "Plugins", modules = {} }
+    REG.Plugins = SECTION
+end
+for i = 1, #MODULES do
+    SECTION.modules[#SECTION.modules + 1] = MODULES[i]
+end
+
+OwnSection = function()
+    local owner = SECTION.owner
+    if owner and EllesmereUI.GetPluginModuleKey
+       and EllesmereUI.GetPluginModuleKey(owner, "EUI_Sparks") then
+        return
+    end
+    if not EllesmereUI.RegisterPlugin then return end
+    if EllesmereUI.RegisterPlugin("EUI_GCDSpark", {
+        label = SECTION.label,
+        modules = MODULES,
+    }) then
+        SECTION.owner = SECTION.owner or "EUI_GCDSpark"
+    end
 end
 
 SLASH_EUIGCDSPARK1 = "/gcdspark"
 SlashCmdList["EUIGCDSPARK"] = function()
-    if EllesmereUI.OpenPlugin then
-        EllesmereUI.OpenPlugin("EUI_GCDSpark")
-    end
+    if not EllesmereUI.OpenPlugin then return end
+    if SECTION.owner and EllesmereUI.OpenPlugin(SECTION.owner, "EUI_Sparks") then return end
+    EllesmereUI.OpenPlugin("EUI_GCDSpark", "EUI_Sparks")
 end
 
 Apply()
+ApplyMissing()
