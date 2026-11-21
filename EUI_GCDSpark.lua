@@ -455,7 +455,10 @@ end
 
 if EllesmereUI.RegisterPlugin then
     EllesmereUI.RegisterPlugin("EUI_GCDSpark", {
-        label = "Spark Overlays",
+        -- EUI gives every plugin its own sidebar section; there is no shared
+        -- "Plugins" group, so the section itself is named Plugins, the same
+        -- convention LootRollFrames uses.
+        label = "Plugins",
         modules = {
             {
                 key = "Spark",

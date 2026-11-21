@@ -2,7 +2,7 @@
 ## Title: |cff0cd29fEUI|r Sparks
 ## Notes: Overlay sparks for the EllesmereUI player power bar (global cooldown) and cast bar. Works without editing EllesmereUI.
 ## Author: jadee
-## Version: 1.1.0
+## Version: 1.1.1
 ## Dependencies: EllesmereUI
 ## OptionalDeps: EllesmereUIUnitFrames
 ## SavedVariables: EUI_GCDSparkDB
