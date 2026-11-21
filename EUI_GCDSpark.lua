@@ -41,8 +41,32 @@ local DEFAULTS = {
 local MAX_GCD = 1.6
 local GCD_SPELL = EllesmereUI.GCD_SPELL or 61304
 local SPARK_TEX = "Interface\\AddOns\\EllesmereUI\\media\\cast_spark.tga"
-local IMMEDIATE = Enum.StatusBarInterpolation.Immediate
-local ELAPSED = Enum.StatusBarTimerDirection.ElapsedTime
+local ADDON_VERSION = "1.3.1"
+
+-- Saved settings first: a client API below must never stop the table from
+-- being seeded or saved.
+local DB = _G.EUI_GCDSparkDB
+if type(DB) ~= "table" then
+    DB = {}
+    _G.EUI_GCDSparkDB = DB
+end
+local function SeedDB(t)
+    if t.enabled == nil then t.enabled = DEFAULTS.enabled end
+    if t.width == nil then t.width = DEFAULTS.width end
+    if t.castbarEnabled == nil then t.castbarEnabled = DEFAULTS.castbarEnabled end
+    if t.castbarWidth == nil then t.castbarWidth = DEFAULTS.castbarWidth end
+    if t.missingPlayer == nil then t.missingPlayer = DEFAULTS.missingPlayer end
+    if t.missingTarget == nil then t.missingTarget = DEFAULTS.missingTarget end
+    if t.missingPos == nil then t.missingPos = DEFAULTS.missingPos end
+    if type(t.missingColor) ~= "table" then
+        local c = DEFAULTS.missingColor
+        t.missingColor = { r = c.r, g = c.g, b = c.b, a = c.a }
+    end
+end
+SeedDB(DB)
+
+local IMMEDIATE = Enum.StatusBarInterpolation and Enum.StatusBarInterpolation.Immediate
+local ELAPSED = Enum.StatusBarTimerDirection and Enum.StatusBarTimerDirection.ElapsedTime
 local GetCD = C_Spell and C_Spell.GetSpellCooldown
 local GetCDDur = C_Spell and C_Spell.GetSpellCooldownDuration
 local UnitHealthMissing = _G.UnitHealthMissing
@@ -53,28 +77,12 @@ local UnitIsDeadOrGhost = _G.UnitIsDeadOrGhost
 local UnitHasVehicleUI = _G.UnitHasVehicleUI
 local AbbreviateNumbers = _G.AbbreviateNumbers
 
-local DB = _G.EUI_GCDSparkDB
-if type(DB) ~= "table" then
-    DB = {}
-    _G.EUI_GCDSparkDB = DB
-end
-if DB.enabled == nil then DB.enabled = DEFAULTS.enabled end
-if DB.width == nil then DB.width = DEFAULTS.width end
-if DB.castbarEnabled == nil then DB.castbarEnabled = DEFAULTS.castbarEnabled end
-if DB.castbarWidth == nil then DB.castbarWidth = DEFAULTS.castbarWidth end
-if DB.missingPlayer == nil then DB.missingPlayer = DEFAULTS.missingPlayer end
-if DB.missingTarget == nil then DB.missingTarget = DEFAULTS.missingTarget end
-if DB.missingPos == nil then DB.missingPos = DEFAULTS.missingPos end
-if DB.missingColor == nil then
-    local c = DEFAULTS.missingColor
-    DB.missingColor = { r = c.r, g = c.g, b = c.b, a = c.a }
-end
-
 local frame = CreateFrame("Frame")
 local overlay
 local hookedBar
 local EnsureOverlay
 local OwnSection
+local UpdateMissing
 local castSpark            -- the castbar spark texture (castbar.Spark)
 local castBar              -- the castbar holding it
 local gcdEnd              -- end time of the running GCD sweep; nil while idle
@@ -82,7 +90,7 @@ local gcdObj              -- duration object for the running GCD
 local gcdTicker           -- end watcher while the GCD values are secret
 local gcdStamp            -- same-frame collapse for SPELL_UPDATE_COOLDOWN
 local lastGcdStart        -- start of the last captured GCD
-local gcdDur = C_DurationUtil and C_DurationUtil.CreateDuration()
+local gcdDur = C_DurationUtil and C_DurationUtil.CreateDuration and C_DurationUtil.CreateDuration()
 local gcdTimer = frame:CreateAnimationGroup()
 local gcdSpan = gcdTimer:CreateAnimation("Animation")
 
@@ -220,6 +228,10 @@ local function EnsureMissing(unit)
         LayoutMissing(rec)
         return rec
     end
+    if not bar.__euiMissingHooked then
+        bar.__euiMissingHooked = true
+        bar:HookScript("OnShow", function() UpdateMissing(unit) end)
+    end
     if InCombatLockdown() then return nil end
     if rec then rec.box:Hide() end
     local box = CreateFrame("Frame", nil, bar)
@@ -236,7 +248,7 @@ local function EnsureMissing(unit)
     return rec
 end
 
-local function UpdateMissing(unit)
+UpdateMissing = function(unit)
     local rec = missingRecs[unit]
     if not MissingOn(unit) then
         if rec then rec.box:Hide() end
@@ -578,12 +590,21 @@ local function Apply()
 end
 
 frame:SetScript("OnEvent", function(_, event, unit)
+    if event == "PLAYER_LOGOUT" then
+        -- Save the table the settings pages write, even if something replaced
+        -- the global during the session, and materialize every key.
+        _G.EUI_GCDSparkDB = DB
+        SeedDB(DB)
+        return
+    end
     if event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD" then
         Apply()
         ApplyMissing()
         OwnSection()
         C_Timer.After(1, Apply)
         C_Timer.After(1, ApplyMissing)
+        C_Timer.After(2, ApplyMissing)
+        C_Timer.After(5, ApplyMissing)
         return
     end
     if event == "PLAYER_TARGET_CHANGED" then
@@ -621,6 +642,7 @@ frame:SetScript("OnEvent", function(_, event, unit)
 end)
 frame:RegisterEvent("PLAYER_LOGIN")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+frame:RegisterEvent("PLAYER_LOGOUT")
 
 -- Plugin page in the EllesmereUI options panel.
 local function BuildPage(pageName, parent, yOffset)
@@ -770,7 +792,16 @@ OwnSection = function()
 end
 
 SLASH_EUIGCDSPARK1 = "/gcdspark"
-SlashCmdList["EUIGCDSPARK"] = function()
+SlashCmdList["EUIGCDSPARK"] = function(msg)
+    msg = type(msg) == "string" and msg:lower() or ""
+    if msg == "status" then
+        local c = type(DB.missingColor) == "table" and DB.missingColor or DEFAULTS.missingColor
+        print(("EUI Extras %s: sparks=%s castbar=%s missing player=%s target=%s pos=%s color=%.2f,%.2f,%.2f,%.2f"):format(
+            ADDON_VERSION, tostring(DB.enabled), tostring(DB.castbarEnabled),
+            tostring(DB.missingPlayer), tostring(DB.missingTarget), tostring(DB.missingPos),
+            c.r, c.g, c.b, c.a or 1))
+        return
+    end
     if not EllesmereUI.OpenPlugin then return end
     if SECTION.owner and EllesmereUI.OpenPlugin(SECTION.owner, "EUI_Sparks") then return end
     EllesmereUI.OpenPlugin("EUI_GCDSpark", "EUI_Sparks")
